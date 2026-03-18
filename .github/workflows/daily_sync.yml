@@ -1,0 +1,32 @@
+name: Sync Comprobantes ARCA
+
+on:
+  schedule:
+    # Corre cada 3 días a las 8:00 AM hora Argentina (UTC-3 → 11:00 UTC)
+    - cron: "0 11 */3 * *"
+  workflow_dispatch:
+    # Permite correrlo manualmente desde la pestaña Actions de GitHub
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install requests gspread google-auth
+
+      - name: Ejecutar sincronización
+        env:
+          AFIPSDK_TOKEN: ${{ secrets.AFIPSDK_TOKEN }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          CLIENTS_JSON: ${{ secrets.CLIENTS_JSON }}
+        run: python sync_comprobantes.py
