@@ -26,7 +26,7 @@ Formato de CLIENTS_JSON:
   },
   {
     "nombre": "Obrador Florida",
-    "username": "27222222223",
+    "username": "23234071344",
     "password": "clave456"
   }
 ]
@@ -42,19 +42,30 @@ from google.oauth2.service_account import Credentials
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
 
-AFIPSDK_BASE   = "https://app.afipsdk.com/api/v1"
-POLL_INTERVAL  = 5     # segundos entre cada chequeo
-MAX_WAIT       = 300   # tiempo máximo de espera por automatización (seg)
-MAX_RETRIES    = 3     # reintentos ante error 500
-RETRY_WAIT     = 15    # segundos entre reintentos
-CHUNK_DAYS     = 15    # máximo de días por request (para rangos largos)
+AFIPSDK_BASE  = "https://app.afipsdk.com/api/v1"
+POLL_INTERVAL = 5
+MAX_WAIT      = 300
+MAX_RETRIES   = 3
+RETRY_WAIT    = 15
+CHUNK_DAYS    = 15
 
 CURRENCY_FIELDS = {
-    "Imp. Neto Gravado",
+    "Imp. Neto Gravado IVA 0%",
+    "Imp. Neto Gravado IVA 2,5%",
+    "Imp. Neto Gravado IVA 5%",
+    "Imp. Neto Gravado IVA 10,5%",
+    "Imp. Neto Gravado IVA 21%",
+    "Imp. Neto Gravado IVA 27%",
+    "Imp. Neto Gravado Total",
+    "IVA 2,5%",
+    "IVA 5%",
+    "IVA 10,5%",
+    "IVA 21%",
+    "IVA 27%",
+    "Total IVA",
     "Imp. Neto No Gravado",
     "Imp. Op. Exentas",
     "Otros Tributos",
-    "IVA",
     "Imp. Total",
 }
 
@@ -65,26 +76,45 @@ COLUMNS = [
     "Número Desde",
     "Número Hasta",
     "Cód. Autorización",
+    # Emisor
+    "Tipo Doc. Emisor",
+    "Nro. Doc. Emisor",
+    "Denominación Emisor",
+    # Receptor
     "Tipo Doc. Receptor",
     "Nro. Doc. Receptor",
-    "Denominación Receptor",
+    # Moneda
     "Moneda",
     "Tipo Cambio",
-    "Imp. Neto Gravado",
+    # Importes por alícuota
+    "Imp. Neto Gravado IVA 0%",
+    "Imp. Neto Gravado IVA 2,5%",
+    "IVA 2,5%",
+    "Imp. Neto Gravado IVA 5%",
+    "IVA 5%",
+    "Imp. Neto Gravado IVA 10,5%",
+    "IVA 10,5%",
+    "Imp. Neto Gravado IVA 21%",
+    "IVA 21%",
+    "Imp. Neto Gravado IVA 27%",
+    "IVA 27%",
+    # Totales
+    "Imp. Neto Gravado Total",
     "Imp. Neto No Gravado",
     "Imp. Op. Exentas",
     "Otros Tributos",
-    "IVA",
+    "Total IVA",
     "Imp. Total",
 ]
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def parse_amount(value) -> float:
-    """Convierte '3.772.000,00' o '40136,00' a float."""
-    if not value or str(value).strip() in ("", "-"):
+    """Convierte '3.117.355,37' o '654644,63' a float. Vacío → 0."""
+    s = str(value).strip()
+    if s in ("", "-", "0"):
         return 0.0
-    cleaned = str(value).replace(".", "").replace(",", ".")
+    cleaned = s.replace(".", "").replace(",", ".")
     try:
         return float(cleaned)
     except ValueError:
@@ -98,12 +128,11 @@ def format_row(comp: dict) -> list:
         if col in CURRENCY_FIELDS:
             row.append(parse_amount(val))
         else:
-            row.append(val)
+            row.append(val if val is not None else "")
     return row
 
 
 def date_chunks(fecha_desde: date, fecha_hasta: date, chunk_days: int):
-    """Divide un rango de fechas en chunks de N días."""
     current = fecha_desde
     while current <= fecha_hasta:
         end = min(current + timedelta(days=chunk_days - 1), fecha_hasta)
@@ -131,8 +160,7 @@ def create_automation(token: str, cuit: str, username: str, password: str,
     resp = requests.post(f"{AFIPSDK_BASE}/automations", json=payload,
                          headers=headers, timeout=30)
     resp.raise_for_status()
-    data = resp.json()
-    return data["id"]
+    return resp.json()["id"]
 
 
 def poll_automation(token: str, automation_id: str) -> list[dict]:
@@ -151,46 +179,40 @@ def poll_automation(token: str, automation_id: str) -> list[dict]:
         elif status == "error":
             msg = data.get("data", {}).get("message", "Error desconocido")
             raise RuntimeError(f"Error ARCA: {msg}")
-        # sigue esperando si está in_process
     raise TimeoutError(f"Timeout esperando automatización {automation_id}")
 
 
-def fetch_comprobantes_with_retry(token: str, cuit: str, username: str, password: str,
-                                   fecha_desde_str: str, fecha_hasta_str: str) -> list[dict]:
-    """Crea la automatización con reintentos ante error 500."""
+def fetch_with_retry(token: str, cuit: str, username: str, password: str,
+                     desde_str: str, hasta_str: str) -> list[dict]:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"  → Consultando {fecha_desde_str} - {fecha_hasta_str} (intento {attempt})")
-            automation_id = create_automation(token, cuit, username, password,
-                                              fecha_desde_str, fecha_hasta_str)
-            comprobantes = poll_automation(token, automation_id)
-            print(f"    ✓ {len(comprobantes)} comprobante(s)")
-            return comprobantes
+            print(f"  → Consultando {desde_str} - {hasta_str} (intento {attempt})")
+            aid = create_automation(token, cuit, username, password, desde_str, hasta_str)
+            result = poll_automation(token, aid)
+            print(f"    ✓ {len(result)} comprobante(s)")
+            return result
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 500:
-                print(f"    ⚠ Error 500 de Afip SDK (intento {attempt}/{MAX_RETRIES})")
+                print(f"    ⚠ Error 500 (intento {attempt}/{MAX_RETRIES})")
                 if attempt < MAX_RETRIES:
-                    print(f"    → Reintentando en {RETRY_WAIT}s...")
                     time.sleep(RETRY_WAIT)
                 else:
-                    raise RuntimeError(f"Falló después de {MAX_RETRIES} intentos: {e}")
+                    raise RuntimeError(f"Falló tras {MAX_RETRIES} intentos: {e}")
             else:
                 raise
     return []
 
 
-def fetch_comprobantes_chunked(token: str, cuit: str, username: str, password: str,
-                                fecha_desde: date, fecha_hasta: date) -> list[dict]:
-    """Descarga en chunks de CHUNK_DAYS días para evitar timeouts."""
-    all_comprobantes = []
+def fetch_chunked(token: str, cuit: str, username: str, password: str,
+                  fecha_desde: date, fecha_hasta: date) -> list[dict]:
+    all_comp = []
     for chunk_start, chunk_end in date_chunks(fecha_desde, fecha_hasta, CHUNK_DAYS):
-        desde_str = chunk_start.strftime("%d/%m/%Y")
-        hasta_str = chunk_end.strftime("%d/%m/%Y")
-        comprobantes = fetch_comprobantes_with_retry(
-            token, cuit, username, password, desde_str, hasta_str
-        )
-        all_comprobantes.extend(comprobantes)
-    return all_comprobantes
+        all_comp.extend(fetch_with_retry(
+            token, cuit, username, password,
+            chunk_start.strftime("%d/%m/%Y"),
+            chunk_end.strftime("%d/%m/%Y")
+        ))
+    return all_comp
 
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
@@ -212,29 +234,27 @@ def write_header_if_needed(worksheet):
 
 def apply_currency_format(spreadsheet, worksheet):
     try:
-        col_indices = [COLUMNS.index(c) for c in COLUMNS if c in CURRENCY_FIELDS]
-        reqs = []
-        for col_idx in col_indices:
-            reqs.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": worksheet.id,
-                        "startRowIndex": 1,
-                        "startColumnIndex": col_idx,
-                        "endColumnIndex": col_idx + 1,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}
-                        }
-                    },
-                    "fields": "userEnteredFormat.numberFormat",
-                }
-            })
+        col_indices = [i for i, c in enumerate(COLUMNS) if c in CURRENCY_FIELDS]
+        reqs = [{
+            "repeatCell": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "startRowIndex": 1,
+                    "startColumnIndex": col_idx,
+                    "endColumnIndex": col_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}
+                    }
+                },
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        } for col_idx in col_indices]
         if reqs:
             spreadsheet.batch_update({"requests": reqs})
     except Exception as e:
-        print(f"  ⚠ No se pudo aplicar formato moneda: {e}")
+        print(f"  ⚠ Formato moneda: {e}")
 
 
 def get_existing_caes(worksheet) -> set:
@@ -269,7 +289,7 @@ def main():
     fecha_desde = fecha_hasta - timedelta(days=days_back - 1)
 
     print(f"📅 Período: {fecha_desde.strftime('%d/%m/%Y')} → {fecha_hasta.strftime('%d/%m/%Y')}")
-    print(f"   ({days_back} días, en chunks de {CHUNK_DAYS})\n")
+    print(f"   ({days_back} días, chunks de {CHUNK_DAYS})\n")
 
     afipsdk_token    = os.environ["AFIPSDK_TOKEN"]
     spreadsheet_id   = os.environ["SPREADSHEET_ID"]
@@ -289,11 +309,9 @@ def main():
     for client in clients:
         username = client["username"]
         password = client["password"]
-
-        if "entities" in client:
-            entities = client["entities"]
-        else:
-            entities = [{"cuit": client.get("cuit", username), "nombre": client["nombre"]}]
+        entities = client.get("entities", [
+            {"cuit": client.get("cuit", username), "nombre": client["nombre"]}
+        ])
 
         for entity in entities:
             cuit       = entity["cuit"]
@@ -302,7 +320,7 @@ def main():
             print(f"━━━ {entity['nombre']} ({cuit}) ━━━")
 
             try:
-                comprobantes = fetch_comprobantes_chunked(
+                comprobantes = fetch_chunked(
                     afipsdk_token, cuit, username, password,
                     fecha_desde, fecha_hasta
                 )
@@ -317,7 +335,7 @@ def main():
                 existing_caes = get_existing_caes(worksheet)
                 nuevos = append_comprobantes(worksheet, comprobantes, existing_caes)
                 total_nuevos += nuevos
-                print(f"  → {nuevos} comprobante(s) nuevo(s) agregado(s)\n")
+                print(f"  → {nuevos} comprobante(s) nuevo(s)\n")
 
             except Exception as e:
                 print(f"  ❌ Error: {e}\n")
