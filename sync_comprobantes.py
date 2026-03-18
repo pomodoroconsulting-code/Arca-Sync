@@ -1,14 +1,36 @@
 """
 sync_comprobantes.py
 --------------------
-Descarga los comprobantes recibidos del día anterior de ARCA (via Afip SDK)
-y los sincroniza en un Google Sheet (una pestaña por cliente).
+Descarga los comprobantes recibidos de ARCA (via Afip SDK)
+y los sincroniza en un Google Sheet (una pestaña por cliente/sociedad).
 
-Requiere las siguientes variables de entorno (GitHub Secrets):
-  - AFIPSDK_TOKEN         : tu access token de Afip SDK
+Variables de entorno requeridas (GitHub Secrets):
+  - AFIPSDK_TOKEN         : access token de Afip SDK
   - GOOGLE_CREDENTIALS    : contenido del JSON de la service account de Google
   - SPREADSHEET_ID        : ID del Google Sheet destino
-  - CLIENTS_JSON          : JSON con los datos de tus clientes (ver README)
+  - CLIENTS_JSON          : JSON con los datos de clientes (ver abajo)
+  - DAYS_BACK             : (opcional) días hacia atrás a consultar. Default: 3
+                            Usar 31 para la carga inicial del mes completo.
+
+Formato de CLIENTS_JSON:
+[
+  {
+    "nombre": "Juan Pérez",
+    "username": "20111111112",
+    "password": "clave123",
+    "entities": [
+      {"cuit": "20111111112", "nombre": "Juan Pérez"},
+      {"cuit": "30711111113", "nombre": "MI EMPRESA SRL"}
+    ]
+  },
+  {
+    "nombre": "Cliente Simple",
+    "username": "27222222223",
+    "password": "clave456"
+  }
+]
+
+Si un cliente no tiene sociedades, omitir "entities" y agregar solo "cuit".
 """
 
 import os
@@ -19,13 +41,21 @@ from datetime import date, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ─── Constantes ──────────────────────────────────────────────────────────────
+# ─── Constantes ───────────────────────────────────────────────────────────────
 
-AFIPSDK_BASE = "https://app.afipsdk.com/api/v1"
-POLL_INTERVAL = 5        # segundos entre cada chequeo de estado
-MAX_WAIT = 180           # tiempo máximo de espera por automatización (seg)
+AFIPSDK_BASE  = "https://app.afipsdk.com/api/v1"
+POLL_INTERVAL = 5    # segundos entre cada chequeo
+MAX_WAIT      = 300  # tiempo máximo de espera por automatización (seg)
 
-# Columnas que se van a guardar en el Sheet (en este orden)
+CURRENCY_FIELDS = {
+    "Imp. Neto Gravado",
+    "Imp. Neto No Gravado",
+    "Imp. Op. Exentas",
+    "Otros Tributos",
+    "IVA",
+    "Imp. Total",
+}
+
 COLUMNS = [
     "Fecha de Emisión",
     "Tipo de Comprobante",
@@ -46,10 +76,35 @@ COLUMNS = [
     "Imp. Total",
 ]
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def parse_amount(value: str) -> float:
+    """Convierte '3.772.000,00' o '40136,00' a float."""
+    if not value or str(value).strip() == "":
+        return 0.0
+    cleaned = str(value).replace(".", "").replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+
+def format_row(comp: dict) -> list:
+    """Construye la fila para el Sheet convirtiendo montos a float."""
+    row = []
+    for col in COLUMNS:
+        val = comp.get(col, "")
+        if col in CURRENCY_FIELDS:
+            row.append(parse_amount(str(val)))
+        else:
+            row.append(val)
+    return row
+
+
 # ─── Afip SDK ─────────────────────────────────────────────────────────────────
 
-def create_automation(token: str, cuit: str, username: str, password: str, fecha: str) -> str:
-    """Inicia la automatización y devuelve el ID."""
+def create_automation(token: str, cuit: str, username: str, password: str,
+                      fecha_desde: str, fecha_hasta: str) -> str:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "automation": "mis-comprobantes",
@@ -59,11 +114,12 @@ def create_automation(token: str, cuit: str, username: str, password: str, fecha
             "password": password,
             "filters": {
                 "t": "R",
-                "fechaEmision": f"{fecha} - {fecha}",
+                "fechaEmision": f"{fecha_desde} - {fecha_hasta}",
             },
         },
     }
-    resp = requests.post(f"{AFIPSDK_BASE}/automations", json=payload, headers=headers, timeout=30)
+    resp = requests.post(f"{AFIPSDK_BASE}/automations", json=payload,
+                         headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     print(f"  → Automatización creada: {data['id']} (status: {data['status']})")
@@ -71,19 +127,19 @@ def create_automation(token: str, cuit: str, username: str, password: str, fecha
 
 
 def poll_automation(token: str, automation_id: str) -> list[dict]:
-    """Espera hasta que la automatización termine y devuelve los comprobantes."""
     headers = {"Authorization": f"Bearer {token}"}
     elapsed = 0
     while elapsed < MAX_WAIT:
         time.sleep(POLL_INTERVAL)
         elapsed += POLL_INTERVAL
-        resp = requests.get(f"{AFIPSDK_BASE}/automations/{automation_id}", headers=headers, timeout=30)
+        resp = requests.get(f"{AFIPSDK_BASE}/automations/{automation_id}",
+                            headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         status = data.get("status")
         if status == "complete":
             comprobantes = data.get("data", [])
-            print(f"  → Completado: {len(comprobantes)} comprobante(s) encontrados")
+            print(f"  → Completado: {len(comprobantes)} comprobante(s)")
             return comprobantes
         elif status == "error":
             msg = data.get("data", {}).get("message", "Error desconocido")
@@ -95,118 +151,138 @@ def poll_automation(token: str, automation_id: str) -> list[dict]:
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
-def get_sheet(spreadsheet_id: str, sheet_name: str, credentials_json: dict):
-    """Obtiene (o crea) una pestaña en el spreadsheet."""
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(credentials_json, scopes=scopes)
-    gc = gspread.authorize(creds)
-    spreadsheet = gc.open_by_key(spreadsheet_id)
-
+def get_or_create_worksheet(spreadsheet, sheet_name: str):
     try:
-        worksheet = spreadsheet.worksheet(sheet_name)
+        return spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=len(COLUMNS) + 2)
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=5000, cols=len(COLUMNS) + 2)
         print(f"  → Pestaña '{sheet_name}' creada")
-
-    return worksheet
-
-
-def get_existing_caes(worksheet) -> set:
-    """Devuelve el conjunto de CAEs ya cargados (para evitar duplicados)."""
-    all_values = worksheet.get_all_values()
-    if len(all_values) < 2:
-        return set()
-    try:
-        header = all_values[0]
-        cae_col = header.index("Cód. Autorización")
-        return {row[cae_col] for row in all_values[1:] if len(row) > cae_col and row[cae_col]}
-    except ValueError:
-        return set()
+        return ws
 
 
 def write_header_if_needed(worksheet):
-    """Escribe la cabecera si la hoja está vacía."""
-    first_row = worksheet.row_values(1)
-    if not first_row:
+    if not worksheet.row_values(1):
         worksheet.append_row(COLUMNS, value_input_option="RAW")
         print("  → Cabecera escrita")
 
 
+def apply_currency_format(spreadsheet, worksheet):
+    """Aplica formato #,##0.00 a las columnas de moneda."""
+    try:
+        col_indices = [COLUMNS.index(c) for c in COLUMNS if c in CURRENCY_FIELDS]
+        reqs = []
+        for col_idx in col_indices:
+            reqs.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": col_idx,
+                        "endColumnIndex": col_idx + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            })
+        if reqs:
+            spreadsheet.batch_update({"requests": reqs})
+    except Exception as e:
+        print(f"  ⚠ No se pudo aplicar formato moneda: {e}")
+
+
+def get_existing_caes(worksheet) -> set:
+    all_values = worksheet.get_all_values()
+    if len(all_values) < 2:
+        return set()
+    try:
+        cae_col = all_values[0].index("Cód. Autorización")
+        return {row[cae_col] for row in all_values[1:]
+                if len(row) > cae_col and row[cae_col]}
+    except ValueError:
+        return set()
+
+
 def append_comprobantes(worksheet, comprobantes: list[dict], existing_caes: set) -> int:
-    """Agrega los comprobantes nuevos al sheet. Devuelve cuántos se agregaron."""
     rows_to_add = []
     for comp in comprobantes:
         cae = comp.get("Cód. Autorización", "")
         if cae and cae in existing_caes:
-            continue  # ya existe, salteamos
-        row = [comp.get(col, "") for col in COLUMNS]
-        rows_to_add.append(row)
-
+            continue
+        rows_to_add.append(format_row(comp))
     if rows_to_add:
-        worksheet.append_rows(rows_to_add, value_input_option="RAW")
-
+        worksheet.append_rows(rows_to_add, value_input_option="USER_ENTERED")
     return len(rows_to_add)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # Fecha de ayer en formato dd/mm/yyyy
-    yesterday = date.today() - timedelta(days=1)
-    fecha_str = yesterday.strftime("%d/%m/%Y")
-    print(f"📅 Sincronizando comprobantes del {fecha_str}\n")
+    days_back    = int(os.environ.get("DAYS_BACK", "3"))
+    fecha_hasta  = date.today() - timedelta(days=1)
+    fecha_desde  = fecha_hasta - timedelta(days=days_back - 1)
+    fecha_desde_str = fecha_desde.strftime("%d/%m/%Y")
+    fecha_hasta_str = fecha_hasta.strftime("%d/%m/%Y")
 
-    # Variables de entorno
-    afipsdk_token = os.environ["AFIPSDK_TOKEN"]
-    spreadsheet_id = os.environ["SPREADSHEET_ID"]
+    print(f"📅 Período: {fecha_desde_str} → {fecha_hasta_str}\n")
+
+    afipsdk_token    = os.environ["AFIPSDK_TOKEN"]
+    spreadsheet_id   = os.environ["SPREADSHEET_ID"]
     credentials_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-    clients = json.loads(os.environ["CLIENTS_JSON"])
+    clients          = json.loads(os.environ["CLIENTS_JSON"])
 
-    # clients debe ser una lista como:
-    # [
-    #   {"nombre": "Cliente A", "cuit": "20111111112", "password": "clave123"},
-    #   ...
-    # ]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds       = Credentials.from_service_account_info(credentials_json, scopes=scopes)
+    gc          = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(spreadsheet_id)
 
     total_nuevos = 0
 
     for client in clients:
-        nombre = client["nombre"]
-        cuit = client["cuit"]
+        username = client["username"]
         password = client["password"]
-        sheet_name = f"{nombre} - Recibidos"
 
-        print(f"━━━ {nombre} ({cuit}) ━━━")
+        # Armar lista de entidades a consultar
+        if "entities" in client:
+            entities = client["entities"]
+        else:
+            entities = [{"cuit": client.get("cuit", username), "nombre": client["nombre"]}]
 
-        try:
-            # 1. Ejecutar automatización en Afip SDK
-            automation_id = create_automation(afipsdk_token, cuit, cuit, password, fecha_str)
-            comprobantes = poll_automation(afipsdk_token, automation_id)
+        for entity in entities:
+            cuit       = entity["cuit"]
+            sheet_name = f"{entity['nombre']} - Recibidos"
 
-            if not comprobantes:
-                print(f"  → Sin comprobantes para el {fecha_str}")
-                print()
-                continue
+            print(f"━━━ {entity['nombre']} ({cuit}) ━━━")
 
-            # 2. Conectar al Google Sheet
-            worksheet = get_sheet(spreadsheet_id, sheet_name, credentials_json)
-            write_header_if_needed(worksheet)
-            existing_caes = get_existing_caes(worksheet)
+            try:
+                automation_id = create_automation(
+                    afipsdk_token, cuit, username, password,
+                    fecha_desde_str, fecha_hasta_str
+                )
+                comprobantes = poll_automation(afipsdk_token, automation_id)
 
-            # 3. Escribir filas nuevas
-            nuevos = append_comprobantes(worksheet, comprobantes, existing_caes)
-            total_nuevos += nuevos
-            print(f"  → {nuevos} comprobante(s) nuevo(s) agregado(s) al sheet")
+                if not comprobantes:
+                    print(f"  → Sin comprobantes en el período\n")
+                    continue
 
-        except Exception as e:
-            print(f"  ❌ Error con {nombre}: {e}")
+                worksheet = get_or_create_worksheet(spreadsheet, sheet_name)
+                write_header_if_needed(worksheet)
+                apply_currency_format(spreadsheet, worksheet)
+                existing_caes = get_existing_caes(worksheet)
+                nuevos = append_comprobantes(worksheet, comprobantes, existing_caes)
+                total_nuevos += nuevos
+                print(f"  → {nuevos} comprobante(s) nuevo(s) agregado(s)\n")
 
-        print()
+            except Exception as e:
+                print(f"  ❌ Error: {e}\n")
 
-    print(f"✅ Sincronización completada. Total nuevos: {total_nuevos}")
+    print(f"✅ Listo. Total nuevos: {total_nuevos}")
 
 
 if __name__ == "__main__":
