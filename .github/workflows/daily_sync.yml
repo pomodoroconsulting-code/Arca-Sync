@@ -29,5 +29,4 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           CLIENTS_JSON: ${{ secrets.CLIENTS_JSON }}
-          DAYS_BACK: ${{ secrets.DAYS_BACK }}
         run: python sync_comprobantes.py
