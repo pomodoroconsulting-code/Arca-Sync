@@ -1,27 +1,26 @@
 """
 sync_comprobantes.py
 --------------------
-Descarga los comprobantes recibidos de ARCA (via Afip SDK)
-y los sincroniza en un Google Sheet (una pestaña por cliente/sociedad).
+Descarga comprobantes recibidos Y emitidos de ARCA (via Afip SDK)
+y los sincroniza en un Google Sheet con:
+  - "{cliente} - Recibidos"   : comprobantes recibidos
+  - "{cliente} - Emitidos"    : comprobantes emitidos
+  - "{cliente} - Resumen IVA" : resumen mensual de IVA
 
 Variables de entorno requeridas (GitHub Secrets):
-  - AFIPSDK_TOKEN         : access token de Afip SDK
-  - GOOGLE_CREDENTIALS    : contenido del JSON de la service account de Google
-  - SPREADSHEET_ID        : ID del Google Sheet destino
-  - CLIENTS_JSON          : JSON con los datos de clientes (ver abajo)
-  - DAYS_BACK             : (opcional) días hacia atrás a consultar. Default: 3
-                            Usar 31 para carga inicial del mes completo.
+  - AFIPSDK_TOKEN      : access token de Afip SDK
+  - GOOGLE_CREDENTIALS : contenido del JSON de la service account de Google
+  - SPREADSHEET_ID     : ID del Google Sheet destino
+  - CLIENTS_JSON       : JSON con los datos de clientes
 
 Formato de CLIENTS_JSON:
 [
   {
-    "nombre": "Salomone Martin",
+    "nombre": "Alcortapipol SRL",
     "username": "20310889475",
     "password": "clave123",
     "entities": [
-      {"cuit": "20310889475", "nombre": "Salomone Martin"},
-      {"cuit": "30718439406", "nombre": "Alcortapipol SRL"},
-      {"cuit": "30715288164", "nombre": "Florasalvaje SRL"}
+      {"cuit": "30718439406", "nombre": "Alcortapipol SRL"}
     ]
   },
   {
@@ -37,6 +36,7 @@ import json
 import time
 import requests
 from datetime import date, timedelta
+from collections import defaultdict
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -76,17 +76,13 @@ COLUMNS = [
     "Número Desde",
     "Número Hasta",
     "Cód. Autorización",
-    # Emisor
     "Tipo Doc. Emisor",
     "Nro. Doc. Emisor",
     "Denominación Emisor",
-    # Receptor
     "Tipo Doc. Receptor",
     "Nro. Doc. Receptor",
-    # Moneda
     "Moneda",
     "Tipo Cambio",
-    # Importes por alícuota
     "Imp. Neto Gravado IVA 0%",
     "Imp. Neto Gravado IVA 2,5%",
     "IVA 2,5%",
@@ -98,7 +94,6 @@ COLUMNS = [
     "IVA 21%",
     "Imp. Neto Gravado IVA 27%",
     "IVA 27%",
-    # Totales
     "Imp. Neto Gravado Total",
     "Imp. Neto No Gravado",
     "Imp. Op. Exentas",
@@ -107,10 +102,24 @@ COLUMNS = [
     "Imp. Total",
 ]
 
+RESUMEN_COLUMNS = [
+    "Mes",
+    "Imp. Total Emitidos",
+    "Total IVA Débito Fiscal",
+    "Imp. Total Recibidos",
+    "Total IVA Crédito Fiscal",
+    "Posición IVA (Débito - Crédito)",
+]
+
+MESES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
+}
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def parse_amount(value) -> float:
-    """Convierte '3.117.355,37' o '654644,63' a float. Vacío → 0."""
     s = str(value).strip()
     if s in ("", "-", "0"):
         return 0.0
@@ -140,10 +149,13 @@ def date_chunks(fecha_desde: date, fecha_hasta: date, chunk_days: int):
         current = end + timedelta(days=1)
 
 
+def mes_label(year: int, month: int) -> str:
+    return f"{MESES[month]} {year}"
+
+
 # ─── Afip SDK ─────────────────────────────────────────────────────────────────
 
-def create_automation(token: str, cuit: str, username: str, password: str,
-                      fecha_desde_str: str, fecha_hasta_str: str) -> str:
+def create_automation(token, cuit, username, password, desde_str, hasta_str, tipo):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {
         "automation": "mis-comprobantes",
@@ -152,8 +164,8 @@ def create_automation(token: str, cuit: str, username: str, password: str,
             "username": username,
             "password": password,
             "filters": {
-                "t": "R",
-                "fechaEmision": f"{fecha_desde_str} - {fecha_hasta_str}",
+                "t": tipo,  # "R" = Recibidos, "E" = Emitidos
+                "fechaEmision": f"{desde_str} - {hasta_str}",
             },
         },
     }
@@ -163,7 +175,7 @@ def create_automation(token: str, cuit: str, username: str, password: str,
     return resp.json()["id"]
 
 
-def poll_automation(token: str, automation_id: str) -> list[dict]:
+def poll_automation(token, automation_id):
     headers = {"Authorization": f"Bearer {token}"}
     elapsed = 0
     while elapsed < MAX_WAIT:
@@ -179,15 +191,15 @@ def poll_automation(token: str, automation_id: str) -> list[dict]:
         elif status == "error":
             msg = data.get("data", {}).get("message", "Error desconocido")
             raise RuntimeError(f"Error ARCA: {msg}")
-    raise TimeoutError(f"Timeout esperando automatización {automation_id}")
+    raise TimeoutError(f"Timeout esperando {automation_id}")
 
 
-def fetch_with_retry(token: str, cuit: str, username: str, password: str,
-                     desde_str: str, hasta_str: str) -> list[dict]:
+def fetch_with_retry(token, cuit, username, password, desde_str, hasta_str, tipo):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"  → Consultando {desde_str} - {hasta_str} (intento {attempt})")
-            aid = create_automation(token, cuit, username, password, desde_str, hasta_str)
+            print(f"  → {tipo} | {desde_str} - {hasta_str} (intento {attempt})")
+            aid = create_automation(token, cuit, username, password,
+                                    desde_str, hasta_str, tipo)
             result = poll_automation(token, aid)
             print(f"    ✓ {len(result)} comprobante(s)")
             return result
@@ -203,38 +215,38 @@ def fetch_with_retry(token: str, cuit: str, username: str, password: str,
     return []
 
 
-def fetch_chunked(token: str, cuit: str, username: str, password: str,
-                  fecha_desde: date, fecha_hasta: date) -> list[dict]:
+def fetch_chunked(token, cuit, username, password, fecha_desde, fecha_hasta, tipo):
     all_comp = []
     for chunk_start, chunk_end in date_chunks(fecha_desde, fecha_hasta, CHUNK_DAYS):
         all_comp.extend(fetch_with_retry(
             token, cuit, username, password,
             chunk_start.strftime("%d/%m/%Y"),
-            chunk_end.strftime("%d/%m/%Y")
+            chunk_end.strftime("%d/%m/%Y"),
+            tipo
         ))
     return all_comp
 
 
 # ─── Google Sheets ────────────────────────────────────────────────────────────
 
-def get_or_create_worksheet(spreadsheet, sheet_name: str):
+def get_or_create_worksheet(spreadsheet, sheet_name):
     try:
         return spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=sheet_name, rows=5000, cols=len(COLUMNS) + 2)
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=5000, cols=40)
         print(f"  → Pestaña '{sheet_name}' creada")
         return ws
 
 
-def write_header_if_needed(worksheet):
+def write_header_if_needed(worksheet, columns):
     if not worksheet.row_values(1):
-        worksheet.append_row(COLUMNS, value_input_option="RAW")
+        worksheet.append_row(columns, value_input_option="RAW")
         print("  → Cabecera escrita")
 
 
-def apply_currency_format(spreadsheet, worksheet):
+def apply_currency_format(spreadsheet, worksheet, columns, currency_set):
     try:
-        col_indices = [i for i, c in enumerate(COLUMNS) if c in CURRENCY_FIELDS]
+        col_indices = [i for i, c in enumerate(columns) if c in currency_set]
         reqs = [{
             "repeatCell": {
                 "range": {
@@ -257,7 +269,7 @@ def apply_currency_format(spreadsheet, worksheet):
         print(f"  ⚠ Formato moneda: {e}")
 
 
-def get_existing_caes(worksheet) -> set:
+def get_existing_caes(worksheet):
     all_values = worksheet.get_all_values()
     if len(all_values) < 2:
         return set()
@@ -269,7 +281,7 @@ def get_existing_caes(worksheet) -> set:
         return set()
 
 
-def append_comprobantes(worksheet, comprobantes: list[dict], existing_caes: set) -> int:
+def append_comprobantes(worksheet, comprobantes, existing_caes):
     rows_to_add = []
     for comp in comprobantes:
         cae = comp.get("Cód. Autorización", "")
@@ -279,6 +291,108 @@ def append_comprobantes(worksheet, comprobantes: list[dict], existing_caes: set)
     if rows_to_add:
         worksheet.append_rows(rows_to_add, value_input_option="USER_ENTERED")
     return len(rows_to_add)
+
+
+# ─── Resumen IVA ──────────────────────────────────────────────────────────────
+
+def build_monthly_summary(emitidos: list, recibidos: list) -> list[dict]:
+    """Agrupa emitidos y recibidos por mes y calcula los totales."""
+    summary = defaultdict(lambda: {
+        "imp_total_emitidos": 0.0,
+        "iva_debito": 0.0,
+        "imp_total_recibidos": 0.0,
+        "iva_credito": 0.0,
+    })
+
+    for comp in emitidos:
+        fecha = comp.get("Fecha de Emisión", "")
+        if not fecha or len(fecha) < 7:
+            continue
+        year, month = int(fecha[:4]), int(fecha[5:7])
+        key = (year, month)
+        summary[key]["imp_total_emitidos"] += parse_amount(comp.get("Imp. Total", 0))
+        summary[key]["iva_debito"] += parse_amount(comp.get("Total IVA", 0))
+
+    for comp in recibidos:
+        fecha = comp.get("Fecha de Emisión", "")
+        if not fecha or len(fecha) < 7:
+            continue
+        year, month = int(fecha[:4]), int(fecha[5:7])
+        key = (year, month)
+        summary[key]["imp_total_recibidos"] += parse_amount(comp.get("Imp. Total", 0))
+        summary[key]["iva_credito"] += parse_amount(comp.get("Total IVA", 0))
+
+    result = []
+    for (year, month) in sorted(summary.keys()):
+        d = summary[(year, month)]
+        result.append({
+            "mes": mes_label(year, month),
+            "year": year,
+            "month": month,
+            "imp_total_emitidos": d["imp_total_emitidos"],
+            "iva_debito": d["iva_debito"],
+            "imp_total_recibidos": d["imp_total_recibidos"],
+            "iva_credito": d["iva_credito"],
+            "posicion": d["iva_debito"] - d["iva_credito"],
+        })
+    return result
+
+
+def update_resumen_sheet(spreadsheet, sheet_name, monthly_summary):
+    """Actualiza (o crea) la pestaña de resumen IVA."""
+    worksheet = get_or_create_worksheet(spreadsheet, sheet_name)
+
+    # Leer datos actuales
+    all_values = worksheet.get_all_values()
+
+    # Construir dict de filas existentes por mes
+    existing_rows = {}  # mes_label -> row_index (1-based)
+    if len(all_values) >= 2:
+        for i, row in enumerate(all_values[1:], start=2):
+            if row:
+                existing_rows[row[0]] = i
+
+    # Escribir cabecera si no existe
+    if not all_values or all_values[0] != RESUMEN_COLUMNS:
+        if not all_values:
+            worksheet.append_row(RESUMEN_COLUMNS, value_input_option="RAW")
+        else:
+            worksheet.update("A1", [RESUMEN_COLUMNS], value_input_option="RAW")
+        print(f"  → Cabecera resumen escrita")
+
+    # Formatear columnas numéricas del resumen
+    resumen_currency = {
+        "Imp. Total Emitidos",
+        "Total IVA Débito Fiscal",
+        "Imp. Total Recibidos",
+        "Total IVA Crédito Fiscal",
+        "Posición IVA (Débito - Crédito)",
+    }
+    apply_currency_format(spreadsheet, worksheet, RESUMEN_COLUMNS, resumen_currency)
+
+    rows_updated = 0
+    rows_added = 0
+
+    for entry in monthly_summary:
+        new_row = [
+            entry["mes"],
+            entry["imp_total_emitidos"],
+            entry["iva_debito"],
+            entry["imp_total_recibidos"],
+            entry["iva_credito"],
+            entry["posicion"],
+        ]
+        if entry["mes"] in existing_rows:
+            # Actualizar fila existente
+            row_idx = existing_rows[entry["mes"]]
+            worksheet.update(f"A{row_idx}", [new_row], value_input_option="USER_ENTERED")
+            rows_updated += 1
+        else:
+            # Agregar fila nueva
+            worksheet.append_row(new_row, value_input_option="USER_ENTERED")
+            rows_added += 1
+
+    print(f"  → Resumen: {rows_added} mes(es) nuevo(s), {rows_updated} actualizado(s)")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -315,30 +429,59 @@ def main():
 
         for entity in entities:
             cuit       = entity["cuit"]
-            sheet_name = f"{entity['nombre']} - Recibidos"
+            nombre     = entity["nombre"]
 
-            print(f"━━━ {entity['nombre']} ({cuit}) ━━━")
+            print(f"━━━ {nombre} ({cuit}) ━━━")
 
             try:
-                comprobantes = fetch_chunked(
+                # ── 1. Descargar Recibidos ──
+                print(f"  [Recibidos]")
+                recibidos_nuevos_raw = fetch_chunked(
                     afipsdk_token, cuit, username, password,
-                    fecha_desde, fecha_hasta
+                    fecha_desde, fecha_hasta, "R"
                 )
+                ws_rec = get_or_create_worksheet(spreadsheet, f"{nombre} - Recibidos")
+                write_header_if_needed(ws_rec, COLUMNS)
+                apply_currency_format(spreadsheet, ws_rec, COLUMNS, CURRENCY_FIELDS)
+                caes_rec = get_existing_caes(ws_rec)
+                nuevos_rec = append_comprobantes(ws_rec, recibidos_nuevos_raw, caes_rec)
+                total_nuevos += nuevos_rec
+                print(f"  → {nuevos_rec} recibido(s) nuevo(s)")
 
-                if not comprobantes:
-                    print(f"  → Sin comprobantes en el período\n")
-                    continue
+                # ── 2. Descargar Emitidos ──
+                print(f"  [Emitidos]")
+                emitidos_nuevos_raw = fetch_chunked(
+                    afipsdk_token, cuit, username, password,
+                    fecha_desde, fecha_hasta, "E"
+                )
+                ws_emi = get_or_create_worksheet(spreadsheet, f"{nombre} - Emitidos")
+                write_header_if_needed(ws_emi, COLUMNS)
+                apply_currency_format(spreadsheet, ws_emi, COLUMNS, CURRENCY_FIELDS)
+                caes_emi = get_existing_caes(ws_emi)
+                nuevos_emi = append_comprobantes(ws_emi, emitidos_nuevos_raw, caes_emi)
+                total_nuevos += nuevos_emi
+                print(f"  → {nuevos_emi} emitido(s) nuevo(s)")
 
-                worksheet = get_or_create_worksheet(spreadsheet, sheet_name)
-                write_header_if_needed(worksheet)
-                apply_currency_format(spreadsheet, worksheet)
-                existing_caes = get_existing_caes(worksheet)
-                nuevos = append_comprobantes(worksheet, comprobantes, existing_caes)
-                total_nuevos += nuevos
-                print(f"  → {nuevos} comprobante(s) nuevo(s)\n")
+                # ── 3. Actualizar Resumen IVA ──
+                # Leer TODOS los datos históricos para recalcular el resumen completo
+                print(f"  [Resumen IVA]")
+                todos_recibidos = [
+                    dict(zip(ws_rec.row_values(1), row))
+                    for row in ws_rec.get_all_values()[1:]
+                    if any(row)
+                ]
+                todos_emitidos = [
+                    dict(zip(ws_emi.row_values(1), row))
+                    for row in ws_emi.get_all_values()[1:]
+                    if any(row)
+                ]
+                monthly = build_monthly_summary(todos_emitidos, todos_recibidos)
+                update_resumen_sheet(spreadsheet, f"{nombre} - Resumen IVA", monthly)
 
             except Exception as e:
-                print(f"  ❌ Error: {e}\n")
+                print(f"  ❌ Error: {e}")
+
+            print()
 
     print(f"✅ Listo. Total nuevos: {total_nuevos}")
 
