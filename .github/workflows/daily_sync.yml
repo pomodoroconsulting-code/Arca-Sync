@@ -24,7 +24,7 @@ jobs:
       - name: Ejecutar sincronización
         env:
           AFIPSDK_TOKEN: ${{ secrets.AFIPSDK_TOKEN }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_TEST }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           CLIENTS_JSON: ${{ secrets.CLIENTS_JSON }}
         run: python sync_comprobantes.py
