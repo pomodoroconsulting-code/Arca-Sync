@@ -2,8 +2,10 @@ name: Sync Comprobantes ARCA
 
 on:
   schedule:
-    - cron: "0 11 */3 * *"
+    # Corre los días 5, 10, 15, 20, 25 y 30 de cada mes a las 8:00 AM Argentina (UTC-3 → 11:00 UTC)
+    - cron: "0 11 5,10,15,20,25,30 * *"
   workflow_dispatch:
+    # Permite correrlo manualmente desde la pestaña Actions de GitHub
 
 jobs:
   sync:
@@ -24,8 +26,7 @@ jobs:
       - name: Ejecutar sincronización
         env:
           AFIPSDK_TOKEN: ${{ secrets.AFIPSDK_TOKEN }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_TEST }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           CLIENTS_JSON: ${{ secrets.CLIENTS_JSON }}
-          DAYS_BACK: ${{ secrets.DAYS_BACK }}
         run: python sync_comprobantes.py
