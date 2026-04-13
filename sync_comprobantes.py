@@ -278,9 +278,22 @@ def append_comprobantes(worksheet, comprobantes, razon_social, existing_keys) ->
         if cae and key in existing_keys:
             continue
         rows_to_add.append(format_row(comp, razon_social))
-    if rows_to_add:
-        worksheet.append_rows(rows_to_add, value_input_option="USER_ENTERED")
-    return len(rows_to_add)
+
+    if not rows_to_add:
+        return 0
+
+    # Escribir de a 500 filas para evitar límites de Google Sheets
+    BATCH_SIZE = 500
+    total = 0
+    for i in range(0, len(rows_to_add), BATCH_SIZE):
+        batch = rows_to_add[i:i + BATCH_SIZE]
+        worksheet.append_rows(batch, value_input_option="USER_ENTERED")
+        total += len(batch)
+        print(f"    → Batch {i//BATCH_SIZE + 1}: {len(batch)} filas escritas")
+        if i + BATCH_SIZE < len(rows_to_add):
+            time.sleep(2)  # pausa entre batches
+
+    return total
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
