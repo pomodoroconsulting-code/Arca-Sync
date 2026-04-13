@@ -315,12 +315,6 @@ def main():
     apply_currency_format(spreadsheet, ws_rec)
     apply_currency_format(spreadsheet, ws_emi)
 
-    # Leer CAEs existentes una sola vez
-    time.sleep(2)
-    existing_rec = get_existing_caes(ws_rec)
-    time.sleep(2)
-    existing_emi = get_existing_caes(ws_emi)
-
     total_nuevos = 0
 
     for client in clients:
@@ -337,6 +331,12 @@ def main():
             print(f"━━━ {razon_social} ({cuit}) ━━━")
 
             try:
+                # Leer CAEs existentes por cliente (frescos en cada iteracion)
+                time.sleep(2)
+                existing_rec = get_existing_caes(ws_rec)
+                time.sleep(2)
+                existing_emi = get_existing_caes(ws_emi)
+
                 # Recibidos
                 print(f"  [Recibidos]")
                 recibidos = fetch_chunked(
