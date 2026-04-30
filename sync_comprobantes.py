@@ -13,6 +13,7 @@ Variables de entorno requeridas (GitHub Secrets):
   - GOOGLE_CREDENTIALS : contenido del JSON de la service account de Google
   - SPREADSHEET_ID     : ID del Google Sheet destino
   - CLIENTS_JSON       : JSON con los datos de clientes
+  - DAYS_BACK          : días hacia atrás a consultar (recomendado: 6)
 
 Formato de CLIENTS_JSON:
 [
@@ -33,6 +34,7 @@ Formato de CLIENTS_JSON:
 """
 
 import os
+import sys
 import json
 import time
 import requests
@@ -69,7 +71,6 @@ CURRENCY_FIELDS = {
     "Imp. Total",
 }
 
-# Razón Social va primero para identificar el cliente
 COLUMNS = [
     "Razón Social",
     "Fecha de Emisión",
@@ -118,8 +119,8 @@ def parse_amount(value) -> float:
 
 
 def format_row(comp: dict, razon_social: str) -> list:
-    row = [razon_social]  # primera columna siempre
-    for col in COLUMNS[1:]:  # saltamos "Razón Social" que ya agregamos
+    row = [razon_social]
+    for col in COLUMNS[1:]:
         val = comp.get(col, "")
         if col in CURRENCY_FIELDS:
             row.append(parse_amount(val))
@@ -253,7 +254,7 @@ def apply_currency_format(spreadsheet, worksheet):
 
 
 def get_existing_caes(worksheet) -> set:
-    """Devuelve set de CAE+RazonSocial para evitar duplicados por cliente."""
+    """Lee todos los CAE+RazonSocial existentes en la pestaña (una sola vez)."""
     all_values = worksheet.get_all_values()
     if len(all_values) < 2:
         return set()
@@ -270,36 +271,57 @@ def get_existing_caes(worksheet) -> set:
         return set()
 
 
-def append_comprobantes(worksheet, comprobantes, razon_social, existing_keys) -> int:
+def append_rows_with_retry(worksheet, rows, max_retries=3):
+    """Escribe filas en Sheets con reintentos ante fallos de cuota o red."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+            return
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            wait = 15 * attempt
+            print(f"    ⚠ Error Sheets (intento {attempt}/{max_retries}): {e}. Reintentando en {wait}s...")
+            time.sleep(wait)
+
+
+def append_comprobantes(worksheet, comprobantes, razon_social, existing_keys) -> tuple[int, set]:
+    """
+    Agrega comprobantes nuevos al sheet.
+    Retorna (cantidad_agregada, keys_nuevas) para actualizar el set en memoria.
+    """
     rows_to_add = []
+    new_keys = set()
+
     for comp in comprobantes:
         cae = comp.get("Cód. Autorización", "")
         key = f"{cae}|{razon_social}"
         if cae and key in existing_keys:
             continue
         rows_to_add.append(format_row(comp, razon_social))
+        if cae:
+            new_keys.add(key)
 
     if not rows_to_add:
-        return 0
+        return 0, new_keys
 
-    # Escribir de a 500 filas para evitar límites de Google Sheets
     BATCH_SIZE = 500
     total = 0
     for i in range(0, len(rows_to_add), BATCH_SIZE):
         batch = rows_to_add[i:i + BATCH_SIZE]
-        worksheet.append_rows(batch, value_input_option="USER_ENTERED")
+        append_rows_with_retry(worksheet, batch)
         total += len(batch)
         print(f"    → Batch {i//BATCH_SIZE + 1}: {len(batch)} filas escritas")
         if i + BATCH_SIZE < len(rows_to_add):
-            time.sleep(2)  # pausa entre batches
+            time.sleep(2)
 
-    return total
+    return total, new_keys
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    days_back   = int(os.environ.get("DAYS_BACK", "3"))
+    days_back   = int(os.environ.get("DAYS_BACK", "6"))
     fecha_hasta = date.today() - timedelta(days=1)
     fecha_desde = fecha_hasta - timedelta(days=days_back - 1)
 
@@ -319,7 +341,6 @@ def main():
     gc          = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(spreadsheet_id)
 
-    # Obtener/crear las dos pestañas globales
     ws_rec = get_or_create_worksheet(spreadsheet, "Recibidos")
     ws_emi = get_or_create_worksheet(spreadsheet, "Emitidos")
     write_header_if_needed(ws_rec)
@@ -328,7 +349,14 @@ def main():
     apply_currency_format(spreadsheet, ws_rec)
     apply_currency_format(spreadsheet, ws_emi)
 
-    total_nuevos = 0
+    # Leer CAEs existentes UNA SOLA VEZ antes del loop (evita cuota de Sheets)
+    print("📖 Leyendo comprobantes existentes en el Sheet...")
+    existing_rec = get_existing_caes(ws_rec)
+    existing_emi = get_existing_caes(ws_emi)
+    print(f"   Recibidos existentes: {len(existing_rec)} | Emitidos existentes: {len(existing_emi)}\n")
+
+    total_nuevos  = 0
+    failed_clients = []
 
     for client in clients:
         username = client["username"]
@@ -344,19 +372,16 @@ def main():
             print(f"━━━ {razon_social} ({cuit}) ━━━")
 
             try:
-                # Leer CAEs existentes por cliente (frescos en cada iteracion)
-                time.sleep(2)
-                existing_rec = get_existing_caes(ws_rec)
-                time.sleep(2)
-                existing_emi = get_existing_caes(ws_emi)
-
                 # Recibidos
                 print(f"  [Recibidos]")
                 recibidos = fetch_chunked(
                     afipsdk_token, cuit, username, password,
                     fecha_desde, fecha_hasta, "R"
                 )
-                nuevos_rec = append_comprobantes(ws_rec, recibidos, razon_social, existing_rec)
+                nuevos_rec, new_keys_rec = append_comprobantes(
+                    ws_rec, recibidos, razon_social, existing_rec
+                )
+                existing_rec.update(new_keys_rec)  # actualizar en memoria
                 total_nuevos += nuevos_rec
                 print(f"  → {nuevos_rec} recibido(s) nuevo(s)")
 
@@ -368,16 +393,24 @@ def main():
                     afipsdk_token, cuit, username, password,
                     fecha_desde, fecha_hasta, "E"
                 )
-                nuevos_emi = append_comprobantes(ws_emi, emitidos, razon_social, existing_emi)
+                nuevos_emi, new_keys_emi = append_comprobantes(
+                    ws_emi, emitidos, razon_social, existing_emi
+                )
+                existing_emi.update(new_keys_emi)  # actualizar en memoria
                 total_nuevos += nuevos_emi
                 print(f"  → {nuevos_emi} emitido(s) nuevo(s)")
 
             except Exception as e:
                 print(f"  ❌ Error: {e}")
+                failed_clients.append(razon_social)
 
             print()
 
     print(f"✅ Listo. Total nuevos: {total_nuevos}")
+
+    if failed_clients:
+        print(f"\n❌ Clientes con error ({len(failed_clients)}): {', '.join(failed_clients)}")
+        sys.exit(1)  # hace que GitHub Actions marque el job como fallido y mande email
 
 
 if __name__ == "__main__":
