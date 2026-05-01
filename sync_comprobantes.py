@@ -340,6 +340,7 @@ def main():
     creds       = Credentials.from_service_account_info(credentials_json, scopes=scopes)
     gc          = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(spreadsheet_id)
+    print(f"📊 Sheet conectado: '{spreadsheet.title}' (ID: {spreadsheet_id})")
 
     ws_rec = get_or_create_worksheet(spreadsheet, "Recibidos")
     ws_emi = get_or_create_worksheet(spreadsheet, "Emitidos")
