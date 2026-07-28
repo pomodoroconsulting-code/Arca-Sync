@@ -2,8 +2,8 @@ name: Sync Comprobantes ARCA
 
 on:
   schedule:
-    # Corre los días 5, 10, 15, 20, 25 y 30 de cada mes a las 8:00 AM Argentina (UTC-3 → 11:00 UTC)
-    - cron: "0 11 5,10,15,20,25,30 * *"
+    # Corre todos los días a las 8:00 AM Argentina (UTC-3 → 11:00 UTC)
+    - cron: "0 11 * * *"
   workflow_dispatch:
     # Permite correrlo manualmente desde la pestaña Actions de GitHub
 
