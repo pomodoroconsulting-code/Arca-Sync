@@ -255,7 +255,7 @@ def apply_currency_format(spreadsheet, worksheet):
         print(f"  ⚠ Formato moneda: {e}")
 
 
-KEY_FIELDS = ("Cód. Autorización", "Razón Social", "Tipo de Comprobante",
+KEY_FIELDS = ("Razón Social", "Tipo de Comprobante",
               "Punto de Venta", "Número Desde", "Nro. Doc. Emisor")
 
 
@@ -264,13 +264,11 @@ def _norm(v) -> str:
     return str(v).strip().lstrip("0") or "0"
 
 
-def build_key(cae, razon_social, tipo, pv, numero, emisor) -> str:
-    """Llave de deduplicación. Usa CAE si existe; si no, identifica el
-    comprobante por Tipo+PtoVenta+Número+CUIT emisor (único en AFIP)."""
-    cae = str(cae).strip()
-    if cae:
-        return f"CAE|{cae}|{razon_social}"
-    return "|".join(["COMP", str(razon_social).strip(), str(tipo).strip(),
+def build_key(razon_social, tipo, pv, numero, emisor) -> str:
+    """Llave única del comprobante: Razón Social + Tipo + Punto de Venta +
+    Número + CUIT emisor. NO usa CAE: el CAEA se comparte entre comprobantes
+    distintos, así que deduplicar por CAE perdería facturas reales."""
+    return "|".join([str(razon_social).strip(), str(tipo).strip(),
                      _norm(pv), _norm(numero), _norm(emisor)])
 
 
@@ -315,9 +313,9 @@ def append_comprobantes(worksheet, comprobantes, razon_social, existing_keys) ->
 
     for comp in comprobantes:
         key = build_key(
-            comp.get("Cód. Autorización", ""), razon_social,
-            comp.get("Tipo de Comprobante", ""), comp.get("Punto de Venta", ""),
-            comp.get("Número Desde", ""), comp.get("Nro. Doc. Emisor", ""),
+            razon_social, comp.get("Tipo de Comprobante", ""),
+            comp.get("Punto de Venta", ""), comp.get("Número Desde", ""),
+            comp.get("Nro. Doc. Emisor", ""),
         )
         if key in existing_keys:
             continue
