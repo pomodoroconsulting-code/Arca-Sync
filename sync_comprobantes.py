@@ -167,6 +167,8 @@ def poll_automation(token, automation_id):
         elapsed += POLL_INTERVAL
         resp = requests.get(f"{AFIPSDK_BASE}/automations/{automation_id}",
                             headers=headers, timeout=30)
+        if not resp.ok:
+            print(f"    ⚠ AFIP SDK {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
         data = resp.json()
         status = data.get("status")
