@@ -255,22 +255,40 @@ def apply_currency_format(spreadsheet, worksheet):
         print(f"  ⚠ Formato moneda: {e}")
 
 
+KEY_FIELDS = ("Cód. Autorización", "Razón Social", "Tipo de Comprobante",
+              "Punto de Venta", "Número Desde", "Nro. Doc. Emisor")
+
+
+def _norm(v) -> str:
+    """Normaliza ceros a la izquierda para que matcheen API y Sheet."""
+    return str(v).strip().lstrip("0") or "0"
+
+
+def build_key(cae, razon_social, tipo, pv, numero, emisor) -> str:
+    """Llave de deduplicación. Usa CAE si existe; si no, identifica el
+    comprobante por Tipo+PtoVenta+Número+CUIT emisor (único en AFIP)."""
+    cae = str(cae).strip()
+    if cae:
+        return f"CAE|{cae}|{razon_social}"
+    return "|".join(["COMP", str(razon_social).strip(), str(tipo).strip(),
+                     _norm(pv), _norm(numero), _norm(emisor)])
+
+
 def get_existing_caes(worksheet) -> set:
-    """Lee todos los CAE+RazonSocial existentes en la pestaña (una sola vez)."""
+    """Lee las llaves de dedup de todos los comprobantes existentes (una vez)."""
     all_values = worksheet.get_all_values()
     if len(all_values) < 2:
         return set()
     try:
         header = all_values[0]
-        cae_col = header.index("Cód. Autorización")
-        rs_col  = header.index("Razón Social")
-        return {
-            f"{row[cae_col]}|{row[rs_col]}"
-            for row in all_values[1:]
-            if len(row) > cae_col and row[cae_col]
-        }
+        idx = {name: header.index(name) for name in KEY_FIELDS}
     except ValueError:
         return set()
+    keys = set()
+    for row in all_values[1:]:
+        vals = [row[idx[n]] if len(row) > idx[n] else "" for n in KEY_FIELDS]
+        keys.add(build_key(*vals))
+    return keys
 
 
 def append_rows_with_retry(worksheet, rows, max_retries=3):
@@ -296,13 +314,15 @@ def append_comprobantes(worksheet, comprobantes, razon_social, existing_keys) ->
     new_keys = set()
 
     for comp in comprobantes:
-        cae = comp.get("Cód. Autorización", "")
-        key = f"{cae}|{razon_social}"
-        if cae and key in existing_keys:
+        key = build_key(
+            comp.get("Cód. Autorización", ""), razon_social,
+            comp.get("Tipo de Comprobante", ""), comp.get("Punto de Venta", ""),
+            comp.get("Número Desde", ""), comp.get("Nro. Doc. Emisor", ""),
+        )
+        if key in existing_keys:
             continue
         rows_to_add.append(format_row(comp, razon_social))
-        if cae:
-            new_keys.add(key)
+        new_keys.add(key)
 
     if not rows_to_add:
         return 0, new_keys
