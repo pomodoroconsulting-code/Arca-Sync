@@ -58,6 +58,16 @@ def audit_tab(ws):
     print(f"  Duplicados por CAE:       {len(cae_dups)} llaves / {cae_extra} filas sobrantes")
     print(f"  Duplicados REALES (comp): {len(comp_dups)} llaves / {comp_extra} filas sobrantes")
 
+    # Duplicados REALES: mostrar filas exactas (número de fila en el Sheet)
+    if comp_dups:
+        print("\n  — DUPLICADOS REALES (mismo comprobante repetido) —")
+        show_i = [idx[c] for c in SHOW]
+        for k, group in comp_dups.items():
+            positions = [i + 2 for i, r in enumerate(data) if comp_key(r, idx) == k]
+            print(f"\n  Filas del Sheet {positions} — mismo comprobante:")
+            for r in group:
+                print("    " + " | ".join(str(r[i]) for i in show_i))
+
     # ¿los dups por CAE son mismo comprobante o comprobantes distintos (CAEA)?
     print("\n  — Muestra de llaves CAE duplicadas (¿mismo comprobante o CAEA?) —")
     show_i = [idx[c] for c in SHOW]
