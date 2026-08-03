@@ -2,13 +2,48 @@ name: Sync Comprobantes ARCA
 
 on:
   schedule:
-    # Corre todos los días a las 8:00 AM Argentina (UTC-3 → 11:00 UTC)
+    # Corrida principal: ~8am Argentina nominal (11:00 UTC). Por la demora
+    # habitual de GitHub Actions suele caer alrededor de las 10hs ART.
     - cron: "0 11 * * *"
+    # Reintento: nominal 13hs ART (16:00 UTC). Con la demora habitual cae
+    # ~14-16hs ART. SOLO corre si la corrida anterior terminó en error.
+    - cron: "0 16 * * *"
   workflow_dispatch:
     # Permite correrlo manualmente desde la pestaña Actions de GitHub
 
+permissions:
+  contents: read
+  actions: read            # necesario para leer el resultado de la corrida anterior
+
 jobs:
+  decidir:
+    runs-on: ubuntu-latest
+    outputs:
+      correr: ${{ steps.d.outputs.correr }}
+    steps:
+      - name: ¿Corresponde correr?
+        id: d
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Manual o corrida de la mañana: siempre corre
+          if [ "${{ github.event_name }}" != "schedule" ] || [ "${{ github.event.schedule }}" = "0 11 * * *" ]; then
+            echo "correr=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Reintento de la tarde: solo si la última corrida terminó en error
+          ultima=$(gh run list --workflow daily_sync.yml -R "$GITHUB_REPOSITORY" \
+            --limit 10 --json status,conclusion \
+            --jq 'map(select(.status=="completed")) | .[0].conclusion')
+          echo "Última corrida terminó en: $ultima"
+          if [ "$ultima" = "failure" ]; then
+            echo "correr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "correr=false" >> "$GITHUB_OUTPUT"
+          fi
+
   sync:
+    needs: decidir
+    if: needs.decidir.outputs.correr == 'true'
     runs-on: ubuntu-latest
 
     steps:
