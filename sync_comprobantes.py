@@ -40,7 +40,7 @@ import time
 import smtplib
 import requests
 from email.message import EmailMessage
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -224,6 +224,19 @@ def get_or_create_worksheet(spreadsheet, sheet_name):
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=10000, cols=len(COLUMNS) + 2)
         print(f"  → Pestaña '{sheet_name}' creada")
         return ws
+
+
+def escribir_timestamp(spreadsheet):
+    """Escribe la fecha/hora de última actualización en 'Resumen IVA'!A13.
+
+    Best-effort: si la pestaña no existe o falla la escritura, NO rompe el sync
+    (se loguea y sigue). Escribe SOLO la celda A13; no toca nada más de esa
+    pestaña. Hora en ART (UTC-3 fijo; Argentina no tiene horario de verano)."""
+    ahora = datetime.now(timezone.utc) - timedelta(hours=3)
+    ts = ahora.strftime("%d/%m/%Y %H:%M")
+    ws = spreadsheet.worksheet("Resumen IVA")  # existente; no se crea
+    ws.update_acell("A13", f"Última actualización: {ts} hs (ART)")
+    print(f"  🕒 Timestamp escrito en 'Resumen IVA'!A13: {ts} hs (ART)")
 
 
 def write_header_if_needed(worksheet):
@@ -482,6 +495,14 @@ def main():
             print()
 
     print(f"✅ Listo. Total nuevos: {total_nuevos}")
+
+    # Timestamp de última actualización en 'Resumen IVA'!A13. Best-effort:
+    # nunca debe romper el sync. Se escribe siempre (aunque un cliente haya
+    # fallado): la Sheet igual se actualizó con lo que sí funcionó.
+    try:
+        escribir_timestamp(spreadsheet)
+    except Exception as e:
+        print(f"  ⚠️  No se pudo escribir el timestamp: {e}")
 
     if failed_clients:
         nombres = ", ".join(c["nombre"] for c in failed_clients)
