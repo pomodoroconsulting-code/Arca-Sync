@@ -10,6 +10,11 @@ on:
     - cron: "0 16 * * *"
   workflow_dispatch:
     # Permite correrlo manualmente desde la pestaña Actions de GitHub
+    inputs:
+      prueba_alerta:
+        description: "Enviar SOLO un mail de prueba de la alerta (no corre el sync)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,4 +70,11 @@ jobs:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           CLIENTS_JSON: ${{ secrets.CLIENTS_JSON }}
           DAYS_BACK: ${{ secrets.DAYS_BACK }}
+          # Alerta por mail (Resend) SOLO en el reintento de la tarde: si un
+          # cliente falla los dos intentos del día, avisa. Blip que se arregla
+          # a la tarde → no molesta.
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          MAIL_TO: pomodoroconsulting@gmail.com
+          ES_REINTENTO: ${{ github.event_name == 'schedule' && github.event.schedule == '0 16 * * *' }}
+          PRUEBA_ALERTA: ${{ inputs.prueba_alerta }}
         run: python sync_comprobantes.py

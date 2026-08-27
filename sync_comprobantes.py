@@ -37,7 +37,9 @@ import os
 import sys
 import json
 import time
+import smtplib
 import requests
+from email.message import EmailMessage
 from datetime import date, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
@@ -338,9 +340,61 @@ def append_comprobantes(worksheet, comprobantes, razon_social, existing_keys) ->
     return total, new_keys
 
 
+# ─── Alerta por mail ──────────────────────────────────────────────────────────
+
+def enviar_alerta_email(failed_clients, fecha_desde, fecha_hasta):
+    """Avisa por mail cuando, tras el reintento del día, quedaron clientes sin
+    actualizar. Usa Resend por SMTP (mismo proveedor que la app). No corta el
+    flujo si el envío falla: solo loguea el problema."""
+    api_key   = os.environ.get("RESEND_API_KEY")
+    mail_to   = os.environ.get("MAIL_TO", "pomodoroconsulting@gmail.com")
+    mail_from = os.environ.get("MAIL_FROM", "Arca-Sync <no-responder@pomodorogestion.com>")
+    if not api_key:
+        print("  ⚠ RESEND_API_KEY no configurado: no se envía alerta por mail.")
+        return
+
+    lineas  = "\n".join(
+        f"  • {c['nombre']} (CUIT {c['cuit']}): {c['error']}" for c in failed_clients
+    )
+    periodo = f"{fecha_desde.strftime('%d/%m/%Y')} → {fecha_hasta.strftime('%d/%m/%Y')}"
+    cuerpo  = (
+        "El Arca-Sync corrió (incluido el reintento del día) y estos clientes "
+        f"NO se pudieron actualizar:\n\n{lineas}\n\n"
+        f"Período consultado: {periodo}\n\n"
+        "Suele ser un error transitorio de ARCA / AFIP SDK (el mismo cliente anda "
+        "otros días sin que cambies nada). Si se repite varios días seguidos, "
+        "conviene revisar en AFIP que el servicio 'Mis Comprobantes' siga "
+        "habilitado para ese CUIT.\n"
+    )
+    msg = EmailMessage()
+    msg["Subject"] = f"⚠️ Arca-Sync: {len(failed_clients)} cliente(s) no se actualizaron"
+    msg["From"]    = mail_from
+    msg["To"]      = mail_to
+    msg.set_content(cuerpo)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.resend.com", 465, timeout=30) as smtp:
+            smtp.login("resend", api_key)
+            smtp.send_message(msg)
+        print(f"  ✉ Alerta enviada a {mail_to}")
+    except Exception as e:
+        print(f"  ⚠ No se pudo enviar la alerta por mail: {e}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    # Modo prueba: manda un mail de alerta de test y termina, sin correr el sync.
+    # Se dispara desde Actions (workflow_dispatch) para verificar que el mail llega.
+    if os.environ.get("PRUEBA_ALERTA", "").lower() == "true":
+        print("🧪 Modo prueba: enviando mail de alerta de test.")
+        enviar_alerta_email(
+            [{"nombre": "PRUEBA — ignorar", "cuit": "—",
+              "error": "Mail de prueba de la alerta del Arca-Sync (verificando entrega)."}],
+            date.today() - timedelta(days=6), date.today() - timedelta(days=1),
+        )
+        return
+
     days_back   = int(os.environ.get("DAYS_BACK", "6"))
     fecha_hasta = date.today() - timedelta(days=1)
     fecha_desde = fecha_hasta - timedelta(days=days_back - 1)
@@ -423,15 +477,25 @@ def main():
 
             except Exception as e:
                 print(f"  ❌ Error: {e}")
-                failed_clients.append(razon_social)
+                failed_clients.append({"nombre": razon_social, "cuit": cuit, "error": str(e)})
 
             print()
 
     print(f"✅ Listo. Total nuevos: {total_nuevos}")
 
     if failed_clients:
-        print(f"\n❌ Clientes con error ({len(failed_clients)}): {', '.join(failed_clients)}")
-        sys.exit(1)  # hace que GitHub Actions marque el job como fallido y mande email
+        nombres = ", ".join(c["nombre"] for c in failed_clients)
+        print(f"\n❌ Clientes con error ({len(failed_clients)}): {nombres}")
+        # Aviso por mail SOLO en el reintento de la tarde (2do intento del día):
+        # así un error transitorio que se arregla a la tarde no dispara alerta.
+        # La corrida de la mañana igual sale con exit(1) para que se dispare el
+        # reintento; el mail se manda recién si el reintento TAMBIÉN falló.
+        es_reintento = os.environ.get("ES_REINTENTO", "").lower() == "true"
+        if es_reintento:
+            enviar_alerta_email(failed_clients, fecha_desde, fecha_hasta)
+        else:
+            print("  (Corrida de la mañana: no se envía mail; se reintenta más tarde.)")
+        sys.exit(1)  # marca el job como fallido → dispara el reintento de la tarde
 
 
 if __name__ == "__main__":
