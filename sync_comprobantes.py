@@ -239,6 +239,31 @@ def escribir_timestamp(spreadsheet):
     print(f"  🕒 Timestamp escrito en 'Resumen IVA'!A13: {ts} hs (ART)")
 
 
+def disparar_import_app():
+    """Avisa a la app que importe, ni bien el bot terminó de escribir la Sheet.
+
+    Así el import de la app corre SIEMPRE después del bot, sin depender de
+    horarios (GitHub se atrasa sin aviso). La app lee la Sheet ya actualizada y
+    trae lo nuevo. Best-effort: si la app no responde, se loguea y sigue; la red
+    de seguridad es el cron tardío de Vercel. Requiere APP_URL y CRON_SECRET."""
+    app_url     = os.environ.get("APP_URL", "").rstrip("/")
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if not app_url or not cron_secret:
+        print("  ℹ️  APP_URL/CRON_SECRET no configurados; no se avisa a la app.")
+        return
+    url = f"{app_url}/api/comprobantes-arca/importar"
+    try:
+        resp = requests.post(
+            url, headers={"Authorization": f"Bearer {cron_secret}"}, timeout=180
+        )
+        if resp.status_code == 200:
+            print(f"  📲 Import de la app disparado OK.")
+        else:
+            print(f"  ⚠️  La app respondió {resp.status_code} al disparar el import.")
+    except Exception as e:
+        print(f"  ⚠️  No se pudo avisar a la app: {e}")
+
+
 def write_header_if_needed(worksheet):
     if not worksheet.row_values(1):
         worksheet.append_row(COLUMNS, value_input_option="RAW")
@@ -503,6 +528,11 @@ def main():
         escribir_timestamp(spreadsheet)
     except Exception as e:
         print(f"  ⚠️  No se pudo escribir el timestamp: {e}")
+
+    # Ni bien el bot terminó de escribir la Sheet, le avisa a la app para que
+    # importe. Se hace ANTES del posible exit(1) por cliente fallido: los demás
+    # clientes sí se escribieron y la app tiene que traerlos igual.
+    disparar_import_app()
 
     if failed_clients:
         nombres = ", ".join(c["nombre"] for c in failed_clients)

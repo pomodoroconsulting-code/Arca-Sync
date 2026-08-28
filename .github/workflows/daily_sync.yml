@@ -77,4 +77,8 @@ jobs:
           MAIL_TO: pomodoroconsulting@gmail.com
           ES_REINTENTO: ${{ github.event_name == 'schedule' && github.event.schedule == '0 16 * * *' }}
           PRUEBA_ALERTA: ${{ inputs.prueba_alerta }}
+          # Al terminar, el bot dispara el import de la app (así la app corre
+          # SIEMPRE después del bot, con la Sheet ya actualizada).
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: python sync_comprobantes.py
