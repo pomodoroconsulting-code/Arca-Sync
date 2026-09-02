@@ -445,6 +445,15 @@ def main():
     credentials_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     clients          = json.loads(os.environ["CLIENTS_JSON"])
 
+    # Reintento dirigido: si viene SOLO_CUITS (CUIT separados por coma), se
+    # procesan SOLO esas entidades. Vacío/ausente = corrida completa (mañana o
+    # manual). Así el reintento de la tarde reintenta únicamente lo que falló y no
+    # vuelve a consumir automatizaciones de los clientes que ya funcionaron.
+    raw_solo   = os.environ.get("SOLO_CUITS", "").strip()
+    solo_cuits = {c.strip() for c in raw_solo.split(",") if c.strip()} if raw_solo else None
+    if solo_cuits:
+        print(f"🔁 Reintento dirigido: solo CUIT {sorted(solo_cuits)}\n")
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -477,6 +486,12 @@ def main():
         entities = client.get("entities", [
             {"cuit": client.get("cuit", username), "nombre": client["nombre"]}
         ])
+
+        # Reintento dirigido: quedarse solo con las entidades que fallaron.
+        if solo_cuits is not None:
+            entities = [e for e in entities if str(e["cuit"]).strip() in solo_cuits]
+            if not entities:
+                continue
 
         for entity in entities:
             cuit         = entity["cuit"]
@@ -520,6 +535,18 @@ def main():
             print()
 
     print(f"✅ Listo. Total nuevos: {total_nuevos}")
+
+    # Persistir qué CUIT fallaron, para que el reintento de la tarde corra SOLO
+    # esos (y no los 9 clientes de nuevo). Se escribe siempre: si no falló nadie
+    # queda [] y el reintento ni siquiera corre. El workflow lo sube como artifact
+    # y la corrida de la tarde lo lee. Best-effort: no debe romper el sync.
+    try:
+        cuits_fallidos = [c["cuit"] for c in failed_clients]
+        with open("fallidos.json", "w", encoding="utf-8") as f:
+            json.dump(cuits_fallidos, f)
+        print(f"  💾 fallidos.json escrito: {cuits_fallidos}")
+    except Exception as e:
+        print(f"  ⚠️  No se pudo escribir fallidos.json: {e}")
 
     # Timestamp de última actualización en 'Resumen IVA'!A13. Best-effort:
     # nunca debe romper el sync. Se escribe siempre (aunque un cliente haya

@@ -25,26 +25,39 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       correr: ${{ steps.d.outputs.correr }}
+      solo_cuits: ${{ steps.d.outputs.solo_cuits }}
     steps:
-      - name: ¿Corresponde correr?
+      - name: ¿Corresponde correr? ¿Reintento dirigido?
         id: d
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Manual o corrida de la mañana: siempre corre
+          # Manual o corrida de la mañana: siempre corre, y COMPLETO (sin filtro)
           if [ "${{ github.event_name }}" != "schedule" ] || [ "${{ github.event.schedule }}" = "0 11 * * *" ]; then
-            echo "correr=true" >> "$GITHUB_OUTPUT"; exit 0
+            echo "correr=true" >> "$GITHUB_OUTPUT"
+            echo "solo_cuits=" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           # Reintento de la tarde: solo si la última corrida terminó en error
-          ultima=$(gh run list --workflow daily_sync.yml -R "$GITHUB_REPOSITORY" \
-            --limit 10 --json status,conclusion \
-            --jq 'map(select(.status=="completed")) | .[0].conclusion')
-          echo "Última corrida terminó en: $ultima"
-          if [ "$ultima" = "failure" ]; then
-            echo "correr=true" >> "$GITHUB_OUTPUT"
-          else
+          read -r ultima_id ultima_concl < <(gh run list --workflow daily_sync.yml -R "$GITHUB_REPOSITORY" \
+            --limit 10 --json databaseId,status,conclusion \
+            --jq 'map(select(.status=="completed")) | .[0] | "\(.databaseId) \(.conclusion)"')
+          echo "Última corrida $ultima_id terminó en: $ultima_concl"
+          if [ "$ultima_concl" != "failure" ]; then
             echo "correr=false" >> "$GITHUB_OUTPUT"
+            echo "solo_cuits=" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "correr=true" >> "$GITHUB_OUTPUT"
+          # Bajar el artifact con los CUIT que fallaron a la mañana y armar la
+          # lista para reintentar SOLO esos. Si no se puede leer, se deja vacío:
+          # el sync entonces corre COMPLETO (misma red de seguridad de antes).
+          cuits=""
+          if gh run download "$ultima_id" -R "$GITHUB_REPOSITORY" -n fallidos -D _fallidos 2>/dev/null; then
+            cuits=$(jq -r 'join(",")' _fallidos/fallidos.json 2>/dev/null || echo "")
+          fi
+          echo "CUIT a reintentar: '${cuits}'"
+          echo "solo_cuits=${cuits}" >> "$GITHUB_OUTPUT"
 
   sync:
     needs: decidir
@@ -77,8 +90,20 @@ jobs:
           MAIL_TO: pomodoroconsulting@gmail.com
           ES_REINTENTO: ${{ github.event_name == 'schedule' && github.event.schedule == '0 16 * * *' }}
           PRUEBA_ALERTA: ${{ inputs.prueba_alerta }}
+          # Reintento dirigido: CUIT que fallaron a la mañana (vacío = corre todo).
+          SOLO_CUITS: ${{ needs.decidir.outputs.solo_cuits }}
           # Al terminar, el bot dispara el import de la app (así la app corre
           # SIEMPRE después del bot, con la Sheet ya actualizada).
           APP_URL: ${{ secrets.APP_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: python sync_comprobantes.py
+
+      - name: Guardar CUIT fallidos (para el reintento dirigido)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fallidos
+          path: fallidos.json
+          if-no-files-found: ignore
+          retention-days: 2
+          overwrite: true
