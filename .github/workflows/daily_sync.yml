@@ -2,11 +2,14 @@ name: Sync Comprobantes ARCA
 
 on:
   schedule:
-    # Corrida principal: ~8am Argentina nominal (11:00 UTC). Por la demora
-    # habitual de GitHub Actions suele caer alrededor de las 10hs ART.
+    # Los dos turnos agendados son RED, no el reloj. El reloj lo pone un cron de
+    # Vercel que dispara este workflow a las 10:00 ART con segundos de atraso; el
+    # `schedule` de GitHub, medido en este repo, llega entre 3 y 8,5 horas tarde.
+    #
+    # Por eso ninguno de los dos asume que le toca correr: el job `decidir` mira
+    # qué pasó hoy. Si Vercel ya disparó y salió bien, no corren (no se gasta
+    # cuota de AFIP SDK dos veces). Si no disparó nadie, corren completo.
     - cron: "0 11 * * *"
-    # Reintento: nominal 13hs ART (16:00 UTC). Con la demora habitual cae
-    # ~14-16hs ART. SOLO corre si la corrida anterior terminó en error.
     - cron: "0 16 * * *"
   workflow_dispatch:
     # Permite correrlo manualmente desde la pestaña Actions de GitHub
@@ -27,31 +30,61 @@ jobs:
       correr: ${{ steps.d.outputs.correr }}
       solo_cuits: ${{ steps.d.outputs.solo_cuits }}
     steps:
-      - name: ¿Corresponde correr? ¿Reintento dirigido?
+      - name: ¿Corresponde correr? ¿Completo o solo los que fallaron?
         id: d
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Manual o corrida de la mañana: siempre corre, y COMPLETO (sin filtro)
-          if [ "${{ github.event_name }}" != "schedule" ] || [ "${{ github.event.schedule }}" = "0 11 * * *" ]; then
+          # Manual: siempre corre COMPLETO. Es la puerta de emergencia y no se
+          # toca: si alguien aprieta el botón, es porque quiere la corrida entera.
+          if [ "${{ github.event_name }}" != "schedule" ]; then
             echo "correr=true" >> "$GITHUB_OUTPUT"
             echo "solo_cuits=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Reintento de la tarde: solo si la última corrida terminó en error
-          read -r ultima_id ultima_concl < <(gh run list --workflow daily_sync.yml -R "$GITHUB_REPOSITORY" \
-            --limit 10 --json databaseId,status,conclusion \
-            --jq 'map(select(.status=="completed")) | .[0] | "\(.databaseId) \(.conclusion)"')
-          echo "Última corrida $ultima_id terminó en: $ultima_concl"
-          if [ "$ultima_concl" != "failure" ]; then
+
+          # Turno agendado: no asume nada, mira qué pasó HOY.
+          #
+          # El día se mide en hora de Argentina, no UTC: un turno de la tarde que
+          # llega muy demorado puede caer pasada la medianoche UTC y, contando en
+          # UTC, creería que hoy todavía no corrió nadie.
+          #
+          # Los -10800 segundos son el UTC-3 de Argentina, que no tiene horario de
+          # verano desde 2009. Se restan a mano en vez de usar `date -d` para que
+          # la cuenta sea la misma en el runner y en cualquier máquina donde se
+          # pruebe esto.
+          hoy=$(TZ=America/Argentina/Buenos_Aires date +%F)
+          read -r ultima_id ultima_concl ultima_dia < <(gh run list --workflow daily_sync.yml -R "$GITHUB_REPOSITORY" \
+            --limit 10 --json databaseId,status,conclusion,createdAt \
+            --jq 'map(select(.status=="completed")) | .[0] // {}
+                  | "\(.databaseId // "-") \(.conclusion // "-") \(if .createdAt then ((.createdAt | fromdateiso8601) - 10800 | strftime("%F")) else "-" end)"')
+          echo "Hoy es $hoy. Última corrida terminada: $ultima_id ($ultima_concl) del día $ultima_dia"
+
+          # Hoy no corrió nadie: el cron de Vercel no disparó. Esta es la red,
+          # y le toca la corrida completa.
+          if [ "$ultima_dia" != "$hoy" ]; then
+            echo "Hoy todavía no corrió nadie → corrida COMPLETA."
+            echo "correr=true" >> "$GITHUB_OUTPUT"
+            echo "solo_cuits=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Ya salió bien hoy: no se gasta de nuevo la cuota de AFIP SDK.
+          if [ "$ultima_concl" = "success" ]; then
+            echo "Ya hubo una corrida exitosa hoy → no corre."
             echo "correr=false" >> "$GITHUB_OUTPUT"
             echo "solo_cuits=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          # Corrió hoy y terminó mal (failure, cancelled, timed_out): se reintenta
+          # SOLO los CUIT que fallaron, no los diez.
+          #
+          # Si la lista no se puede leer —la corrida murió antes de escribirla, o
+          # se la cancelaron a mitad de camino— queda vacía y el sync corre
+          # COMPLETO a propósito: sin la lista no sabemos quién quedó afuera, y
+          # perder comprobantes es peor que gastar automatizaciones.
           echo "correr=true" >> "$GITHUB_OUTPUT"
-          # Bajar el artifact con los CUIT que fallaron a la mañana y armar la
-          # lista para reintentar SOLO esos. Si no se puede leer, se deja vacío:
-          # el sync entonces corre COMPLETO (misma red de seguridad de antes).
           cuits=""
           if gh run download "$ultima_id" -R "$GITHUB_REPOSITORY" -n fallidos -D _fallidos 2>/dev/null; then
             cuits=$(jq -r 'join(",")' _fallidos/fallidos.json 2>/dev/null || echo "")
